@@ -28,21 +28,38 @@ of unneeded CUDA libraries. **If your proxy can't reach `download.pytorch.org`**
 
 ## 2. Create the database schema
 
-Against your PostgreSQL + pgvector database:
+**Which script you need depends on whether the database already has a Forge Code schema.**
+
+### A brand-new database
 
 ```bash
-psql -h <host> -U <user> -d <database> -f init.sql
+psql -h <host> -U <user> -d <database> -v ON_ERROR_STOP=1 -f init.sql
 ```
 
-Every statement is idempotent, so re-running it is safe.
+Re-running this against a database it created is safe — every statement is guarded by
+`IF NOT EXISTS`.
 
-**Upgrading an existing deployment** (one created by the previous eight-table `init.sql`)?
-Run the migration instead — it adds the approval columns, scopes the example tables per
-user, and activates the accounts you already created so nobody is locked out:
+### Upgrading a database created by the previous version
+
+Run the **migration**, not `init.sql`:
 
 ```bash
-psql -h <host> -U <user> -d <database> -f migrations/001_auth_and_scoping.sql
+psql -h <host> -U <user> -d <database> -v ON_ERROR_STOP=1 -f migrations/001_auth_and_scoping.sql
 ```
+
+It adds the approval columns, scopes the example tables per user, adds the missing
+indexes, and marks your existing accounts active so nobody is locked out. It runs inside a
+transaction, so a failure part-way leaves the database untouched.
+
+`init.sql` will *not* do this for you: `CREATE TABLE IF NOT EXISTS` skips a table that
+already exists, so the older tables would keep their old columns and the new indexes would
+then fail on the missing ones. `init.sql` detects that case and stops with a pointer to the
+migration — which is why `-v ON_ERROR_STOP=1` is worth passing on both scripts.
+
+The migration deliberately leaves the existing `created_at` columns as `timestamp` rather
+than converting them to `timestamptz`: rewriting historical values risks shifting them by
+the server's UTC offset. The app reads both shapes, so a migrated database and a fresh one
+behave identically.
 
 ## 3. Set environment variables
 

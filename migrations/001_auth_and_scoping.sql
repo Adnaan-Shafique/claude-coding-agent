@@ -55,7 +55,12 @@ ALTER TABLE coding_agent_schema.flagged_answers  ALTER COLUMN user_id SET NOT NU
 CREATE INDEX IF NOT EXISTS golden_examples_user_idx  ON coding_agent_schema.golden_examples (user_id);
 CREATE INDEX IF NOT EXISTS flagged_answers_user_idx  ON coding_agent_schema.flagged_answers (user_id);
 
--- 5. Indexes the original schema was missing.
+-- 5. created_at columns are deliberately left as `timestamp` rather than converted to
+--    `timestamptz`. Converting would reinterpret every existing value using the server's
+--    current TimeZone setting, which can silently shift historical rows. The app reads
+--    naive and aware timestamps alike, so nothing downstream depends on the difference.
+
+-- 6. Indexes the original schema was missing.
 CREATE INDEX IF NOT EXISTS conversations_user_created_idx
     ON coding_agent_schema.conversations (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
