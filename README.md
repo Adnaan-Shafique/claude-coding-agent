@@ -63,23 +63,95 @@ behave identically.
 
 ## 3. Set environment variables
 
-Nothing is hardcoded — the app refuses to start if a required variable is missing.
+Nothing is hardcoded — the app refuses to start if a required variable is missing, naming
+the one it wanted.
 
-### Required
+Keep the settings in a `.env` file next to `app.py` rather than typing `export` lines each
+time. That keeps the database password out of your shell history and out of `ps` output,
+and it is the format systemd wants too.
+
+### Create the file
 
 ```bash
-export POSTGRES_USER=...
-export POSTGRES_PASSWORD=...
-export POSTGRES_DB=...
-export POSTGRES_HOST=...            # your Postgres server's hostname/IP
-export POSTGRES_PORT=5432           # optional, defaults to 5432
+cd /path/to/claude-coding-agent
 
-export GPU_PROXY_URL=http://127.0.0.1:8071/v1/infer   # your Mistral GPU proxy
-export SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+cat > .env <<'EOF'
+POSTGRES_USER=admin
+POSTGRES_PASSWORD='your-password'
+POSTGRES_DB=conv_ai_db
+POSTGRES_HOST=10.0.0.1
+POSTGRES_PORT=5432
+
+GPU_PROXY_URL=http://127.0.0.1:8071/v1/infer
+GPU_API_KEY='your-proxy-key'
+MISTRAL_MODEL_NAME=mistral
+
+SECRET_KEY=paste-the-generated-key-here
+
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+PORT=8054
+EOF
+
+chmod 600 .env
 ```
 
-`SECRET_KEY` signs session tokens. It must be **at least 32 bytes** — a shorter key makes
-PyJWT warn and weakens the signature. Keep it stable: changing it logs everyone out.
+Generate the secret separately and paste it in, so it stays the same across restarts:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Write plain `KEY=value` lines with **no `export` prefix** — that form works both for shell
+sourcing and for systemd's `EnvironmentFile`, so one file covers both. Wrap any value
+containing a space, `$`, or a backtick in **single quotes**, or the shell will interpret it
+when the file is sourced and the variable will silently hold the wrong thing.
+
+`.env` is already in `.gitignore`. Keep it out of `assets/` — Dash serves that whole
+directory over HTTP.
+
+### Load it
+
+```bash
+set -a
+source .env
+set +a
+```
+
+`set -a` marks everything defined until `set +a` for export, which is what turns bare
+`KEY=value` lines into environment variables. Check it took before starting the server:
+
+```bash
+python -c "import backend; print('config ok:', backend.POSTGRES_DB)"
+```
+
+### Edit it later
+
+`.env` starts with a dot, so plain `ls` won't show it — use `ls -a`.
+
+```bash
+nano .env          # Ctrl+O Enter to save, Ctrl+X to quit
+vi .env            # i to edit, Esc then :wq to save and quit
+```
+
+Or change a single value without an editor:
+
+```bash
+sed -i 's|^PORT=.*|PORT=8055|' .env
+```
+
+**The variables are read once at startup**, so re-source the file and restart the app after
+any edit — editing `.env` alone changes nothing in a running process.
+
+### Required variables
+
+| Variable | Meaning |
+| --- | --- |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_HOST` | Database connection |
+| `GPU_PROXY_URL` | Your Mistral GPU proxy, e.g. `http://127.0.0.1:8071/v1/infer` |
+| `SECRET_KEY` | Signs session tokens |
+
+`SECRET_KEY` must be **at least 32 bytes** — a shorter key makes PyJWT warn and weakens the
+signature. Keep it stable: changing it logs everyone out.
 
 ### Optional
 
@@ -123,10 +195,58 @@ account that is active and admin from the start.
 ## 5. Run it
 
 ```bash
+set -a; source .env; set +a
 python app.py
 ```
 
 Open `http://<this-machine>:8054`.
+
+To run it in the background the way the old deployment did, put the two steps in a wrapper
+so you cannot forget the first one:
+
+```bash
+cat > run.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+set -a; source .env; set +a
+exec python app.py
+EOF
+chmod +x run.sh
+
+nohup ./run.sh > backend.log 2>&1 &
+```
+
+`exec` matters here — it replaces the wrapper shell with Python, so a later `kill` reaches
+the app rather than the shell around it.
+
+Better still, let systemd own it, so it restarts on crash and starts on boot. Because `.env`
+is already in systemd's format, it can be pointed at directly:
+
+```ini
+# /etc/systemd/system/forge-code.service
+[Unit]
+Description=Forge Code
+After=network.target
+
+[Service]
+User=youruser
+WorkingDirectory=/path/to/claude-coding-agent
+EnvironmentFile=/path/to/claude-coding-agent/.env
+ExecStart=/path/to/venv/bin/python app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now forge-code
+journalctl -u forge-code -f
+```
+
+Note that systemd's `EnvironmentFile` parser is not a shell: it does no `$VAR` expansion and
+does not understand `export`. Plain `KEY=value` is exactly what it wants.
 
 Werkzeug's built-in server is fine for a small internal team. For anything larger, put a
 real WSGI server in front:
