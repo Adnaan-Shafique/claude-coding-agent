@@ -311,6 +311,12 @@ app.index_string = """
         .vi-pill-active { background: #ECFDF3; color: #1FA971; }
         .vi-pill-pending { background: #FFFBEB; color: #B54708; }
         .vi-pill-admin { background: #FFF1F2; color: #E8442C; }
+        .vi-pill-blocked { background: #FEF3F2; color: #B42318; }
+        .vi-log-question {
+            max-width: 380px; max-height: 72px; overflow: auto; white-space: pre-wrap;
+            word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px; line-height: 1.5;
+        }
 
         /* Loading indicator */
         .vi-spinner {
@@ -975,7 +981,13 @@ def admin_layout(user):
                         style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "marginBottom": "6px"},
                         children=[
                             html.Div("User accounts", style={"fontSize": "20px"}),
-                            dcc.Link("← Back to chat", href="/", className="vi-link"),
+                            html.Div(
+                                style={"display": "flex", "gap": "16px", "alignItems": "center"},
+                                children=[
+                                    dcc.Link("Guardrail log →", href="/guardrails", className="vi-link"),
+                                    dcc.Link("← Back to chat", href="/", className="vi-link"),
+                                ],
+                            ),
                         ],
                     ),
                     html.Div(
@@ -991,6 +1003,108 @@ def admin_layout(user):
                             children=[
                                 html.Thead(html.Tr([html.Th("Username"), html.Th("Email"), html.Th("Status"), html.Th("Role"), html.Th("Registered"), html.Th("Actions")])),
                                 html.Tbody(id="admin-user-rows", children=render_user_rows(users, user["user_id"])),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def render_guardrail_rows(entries):
+    if not entries:
+        return [
+            html.Tr(
+                html.Td(
+                    "Nothing recorded yet.",
+                    colSpan=8,
+                    style={"color": COLORS["text_dim"], "padding": "18px 12px"},
+                )
+            )
+        ]
+
+    rows = []
+    for entry in entries:
+        pill = (
+            html.Span("Blocked", className="vi-pill vi-pill-blocked")
+            if entry["action"] == "blocked"
+            else html.Span("Flagged", className="vi-pill vi-pill-pending")
+        )
+        question = entry["question"] or ""
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(format_relative_time(entry["created_at"]), style={"whiteSpace": "nowrap", "color": COLORS["text_dim"]}),
+                    html.Td(entry["username"]),
+                    html.Td(pill),
+                    html.Td(html.Code(entry["category"], style={"fontSize": "12px"})),
+                    html.Td(entry["detail"] or entry["rules"], style={"color": COLORS["text_dim"], "maxWidth": "260px"}),
+                    # Already redacted on the way in — see guardrails.redact_secrets().
+                    html.Td(html.Div(question, className="vi-log-question")),
+                    html.Td(
+                        entry["file_name"] or html.Span("—", style={"color": "#98A2B3"}),
+                        style={"whiteSpace": "nowrap"},
+                    ),
+                    html.Td(
+                        entry["client_ip"] or html.Span("—", style={"color": "#98A2B3"}),
+                        style={"whiteSpace": "nowrap", "color": COLORS["text_dim"], "fontSize": "12px"},
+                    ),
+                ]
+            )
+        )
+    return rows
+
+
+def guardrail_layout(user):
+    """Admin view of blocked and flagged requests."""
+    try:
+        entries = backend.list_guardrail_log(user["user_id"], limit=200)
+        counts = backend.guardrail_counts(user["user_id"])
+        error = None
+    except AppError as exc:
+        entries, counts, error = [], [], exc.message
+
+    summary = ", ".join(f"{row['n']} {row['category']} {row['action']}" for row in counts) or "nothing in the last 7 days"
+
+    return html.Div(
+        className="vi-shell",
+        style={"flexDirection": "column"},
+        children=[
+            build_header(user, show_sidebar_toggle=False),
+            html.Div(
+                style={"flex": "1", "overflowY": "auto", "padding": "28px"},
+                children=[
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "marginBottom": "6px"},
+                        children=[
+                            html.Div("Guardrail log", style={"fontSize": "20px"}),
+                            html.Div(
+                                style={"display": "flex", "gap": "16px", "alignItems": "center"},
+                                children=[
+                                    dcc.Link("← User accounts", href="/admin", className="vi-link"),
+                                    dcc.Link("Back to chat", href="/", className="vi-link"),
+                                ],
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        f"Last 7 days: {summary}. Questions are stored with credentials redacted; "
+                        f"uploaded file contents are never stored.",
+                        style={"fontSize": "13px", "color": COLORS["text_dim"], "marginBottom": "20px", "lineHeight": "1.5"},
+                    ),
+                    html.Div(error or "", style={"fontSize": "13px", "marginBottom": "14px", "color": COLORS["red_light"]}),
+                    html.Div(
+                        className="vi-card",
+                        style={"padding": "8px 16px 4px", "overflowX": "auto"},
+                        children=html.Table(
+                            className="vi-table",
+                            children=[
+                                html.Thead(html.Tr([
+                                    html.Th("When"), html.Th("User"), html.Th("Action"),
+                                    html.Th("Category"), html.Th("Why"), html.Th("Request"), html.Th("File"), html.Th("From"),
+                                ])),
+                                html.Tbody(render_guardrail_rows(entries)),
                             ],
                         ),
                     ),
@@ -1028,14 +1142,14 @@ def render_page(pathname):
     if not user:
         return login_layout()
 
-    if pathname == "/admin":
+    if pathname in ("/admin", "/guardrails"):
         if not user["is_admin"]:
             return message_page(
                 "Not available",
                 "That page is for administrators only.",
                 link_label="Back to chat",
             )
-        return admin_layout(user)
+        return guardrail_layout(user) if pathname == "/guardrails" else admin_layout(user)
 
     return chat_layout(user)
 
@@ -1250,7 +1364,7 @@ def handle_send(n_clicks, question, history, attached_file, conversation_id):
     placeholder = {"question": question, "answer": None, "pending": True, "file_name": file_name}
     history = (history or []) + [placeholder]
 
-    pending = {"question": question, "conversation_id": conversation_id}
+    pending = {"question": question, "conversation_id": conversation_id, "client_ip": client_ip()}
     if attached_file:
         pending["file_name"] = file_name
         pending["file_content"] = attached_file.get("content")
@@ -1296,6 +1410,8 @@ def resolve_send(pending, history):
             conversation_id=pending.get("conversation_id"),
             file_name=file_name,
             file_content=pending.get("file_content"),
+            username=user["username"],
+            client_ip=pending.get("client_ip") or client_ip(),
         )
     except AppError as exc:
         return failed(exc.message)

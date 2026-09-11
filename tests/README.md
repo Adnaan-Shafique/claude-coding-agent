@@ -46,3 +46,19 @@ not required either: the similarity-search helpers are the only callers of the v
 operators and they are stubbed, since these tests are about ownership and scoping rather
 than nearest-neighbour search. If your test database lacks pgvector, drop the
 `CREATE EXTENSION` line and change `vector(384)` to `text` when applying `init.sql` to it.
+
+## Guardrail tests
+
+`tests/test_guardrails.py` needs nothing at all — the policy module has no I/O:
+
+```bash
+pytest tests/test_guardrails.py
+```
+
+Roughly half of it asserts what must **not** be flagged. A coding assistant that refuses
+legitimate questions ("how do I write a DELETE with a join", "how should I hash passwords",
+"how does ransomware encrypt files") is worse than one with a gap, because people stop
+trusting it and route around it. Add a must-allow case alongside every new rule.
+
+The database side — redaction on the way into the log, flag-versus-block behaviour, and the
+log surviving user deletion — is covered in `test_integration.py`.

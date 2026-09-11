@@ -18,6 +18,7 @@ Sections:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -33,6 +34,10 @@ import psycopg2
 import requests
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
+
+import guardrails
+
+logger = logging.getLogger(__name__)
 
 # sentence_transformers drags in torch, which takes seconds to import and is only needed
 # once an embedding is actually requested — so it is imported inside get_embedding_model().
@@ -483,6 +488,37 @@ def set_user_admin(admin_id: int, user_id: int, is_admin: bool) -> None:
             raise AppError("No such user.")
 
 
+def list_guardrail_log(admin_id: int, limit: int = 100, category: str | None = None) -> list[dict]:
+    """Recent blocked and flagged requests, newest first, for the admin screen."""
+    _require_admin(admin_id)
+    clause = "WHERE b.category = %s " if category else ""
+    params = ([category] if category else []) + [max(1, min(limit, 500))]
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT b.id, b.username, b.conversation_id, b.action, b.category, b.rules, "
+            "       b.detail, b.question, b.file_name, b.client_ip, b.created_at, c.title "
+            "FROM coding_agent_schema.blocked_queries b "
+            "LEFT JOIN coding_agent_schema.conversations c ON c.id = b.conversation_id "
+            f"{clause}"
+            "ORDER BY b.created_at DESC LIMIT %s",
+            params,
+        )
+        return cur.fetchall()
+
+
+def guardrail_counts(admin_id: int, days: int = 7) -> list[dict]:
+    """Blocked/flagged totals per category over a recent window."""
+    _require_admin(admin_id)
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT category, action, COUNT(*) AS n FROM coding_agent_schema.blocked_queries "
+            "WHERE created_at > NOW() - make_interval(days => %s) "
+            "GROUP BY category, action ORDER BY n DESC",
+            (days,),
+        )
+        return cur.fetchall()
+
+
 def count_pending_users() -> int:
     with db_cursor() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM coding_agent_schema.users WHERE is_active = FALSE")
@@ -702,6 +738,7 @@ class GPUApiClient:
         temperature: float = 0.0,
         top_p: float = 0.9,
         top_k: int = 3,
+        timeout: int | None = None,
     ) -> str:
         payload = {
             "model": model,
@@ -716,7 +753,8 @@ class GPUApiClient:
         for attempt in range(GPU_RETRIES + 1):
             try:
                 response = self._session.post(
-                    self._url, json=payload, headers=self._headers, timeout=self._timeout
+                    self._url, json=payload, headers=self._headers,
+                    timeout=timeout or self._timeout,
                 )
                 response.raise_for_status()
                 return response.json().get("text", "")
@@ -1088,12 +1126,121 @@ def validate_upload(file_name: str | None, file_content: str | None) -> dict | N
     return {"name": name, "content": file_content}
 
 
+def record_guardrail_findings(
+    user_id: int,
+    username: str,
+    findings: list[guardrails.Finding],
+    action: str,
+    question: str,
+    conversation_id: int | None = None,
+    file_name: str | None = None,
+    client_ip: str | None = None,
+) -> None:
+    """Write one row describing a blocked or flagged request.
+
+    The question is redacted first: a log of blocked credential pastes would otherwise be
+    the densest collection of secrets in the system. File content is never recorded.
+    Failures here are swallowed — losing an audit row must not turn into a failed request
+    the user cannot explain.
+    """
+    if not findings:
+        return
+
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO coding_agent_schema.blocked_queries "
+                "(user_id, username, conversation_id, action, category, rules, detail, "
+                " question, file_name, client_ip) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    user_id,
+                    username,
+                    conversation_id,
+                    action,
+                    findings[0].category,
+                    guardrails.summarize(findings),
+                    findings[0].detail,
+                    guardrails.redact_secrets(question)[:MAX_QUESTION_CHARS],
+                    file_name,
+                    client_ip,
+                ),
+            )
+    except Exception:
+        logger.exception("failed to record guardrail findings")
+
+
+def _judge_request(question: str, file_name: str | None) -> guardrails.Finding | None:
+    """Ask Mistral to screen the request. Never raises: a screener outage must not
+    take the tool down, so any failure is treated as ALLOW."""
+    try:
+        raw = get_gpu_client().chat(
+            guardrails.build_judge_messages(question, file_name),
+            max_new_tokens=48,
+            timeout=guardrails.JUDGE_TIMEOUT,
+        )
+    except Exception:
+        logger.warning("guardrail judge unavailable; allowing the request", exc_info=True)
+        return None
+    return guardrails.parse_judge_verdict(raw)
+
+
+def screen_request(
+    user_id: int,
+    username: str,
+    question: str,
+    conversation_id: int | None,
+    file_name: str | None,
+    file_content: str | None,
+    client_ip: str | None,
+) -> None:
+    """Run the guardrails over one request, record what matched, and refuse if required.
+
+    Raises AppError when the request is blocked. Flagged requests return normally, having
+    left a row behind.
+    """
+    findings: list[guardrails.Finding] = []
+
+    rate_finding = guardrails.check_ask_rate(user_id)
+    if rate_finding:
+        findings.append(rate_finding)
+
+    findings += guardrails.evaluate_input(question, file_name, file_content)
+
+    # The judge runs only if nothing deterministic already blocked: it costs an inference
+    # round-trip, and a prompt trying to override instructions must never reach it.
+    if guardrails.JUDGE_ENABLED and not guardrails.decide(findings).blocked:
+        judged = _judge_request(question, file_name)
+        if judged:
+            findings.append(judged)
+
+    verdict = guardrails.decide(findings)
+    if not verdict.findings:
+        return
+
+    record_guardrail_findings(
+        user_id,
+        username,
+        verdict.findings,
+        "blocked" if verdict.blocked else "flagged",
+        question,
+        conversation_id=conversation_id,
+        file_name=file_name,
+        client_ip=client_ip,
+    )
+
+    if verdict.blocked:
+        raise AppError(verdict.message or "That request was refused.")
+
+
 def ask_logic(
     user_id: int,
     question: str,
     conversation_id: int | None = None,
     file_name: str | None = None,
     file_content: str | None = None,
+    username: str = "",
+    client_ip: str | None = None,
 ) -> dict:
     """Answer one question. Mistral is the only model, so there is no model argument.
 
@@ -1113,6 +1260,18 @@ def ask_logic(
     # anything, including as a key to read this user's prompt context.
     if conversation_id is not None:
         assert_conversation_owner(user_id, conversation_id)
+
+    # Screen before spending a GPU slot and before anything is persisted. Ownership is
+    # already checked above, so a recorded conversation_id is known to be this user's.
+    screen_request(
+        user_id=user_id,
+        username=username,
+        question=question,
+        conversation_id=conversation_id,
+        file_name=uploaded_file["name"] if uploaded_file else None,
+        file_content=uploaded_file["content"] if uploaded_file else None,
+        client_ip=client_ip,
+    )
 
     long_term_summary = get_long_term_summary(user_id)
     short_term = get_short_term_history(user_id, conversation_id)

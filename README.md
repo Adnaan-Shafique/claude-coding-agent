@@ -10,6 +10,7 @@ Everything runs as two Python files in one process — no Docker, no build step.
 | --- | --- |
 | `app.py` | Dash UI, callbacks, `/health`, the `create-admin` command |
 | `backend.py` | Config, database, auth, LLM, memory, business logic — no Dash imports |
+| `guardrails.py` | Request screening policy — pure rules, no database or network |
 | `init.sql` | Full database schema (run once) |
 | `migrations/` | Upgrade scripts for databases created by an earlier version |
 | `tests/` | Test suite (see `tests/README.md`) |
@@ -45,7 +46,11 @@ Run the **migration**, not `init.sql`:
 
 ```bash
 psql -h <host> -U <user> -d <database> -v ON_ERROR_STOP=1 -f migrations/001_auth_and_scoping.sql
+psql -h <host> -U <user> -d <database> -v ON_ERROR_STOP=1 -f migrations/002_guardrail_log.sql
 ```
+
+Run them in order. `002` adds the guardrail log; it is safe to re-run and is already
+included in `init.sql`, so fresh installs do not need it.
 
 It adds the approval columns, scopes the example tables per user, adds the missing
 indexes, and marks your existing accounts active so nobody is locked out. It runs inside a
@@ -187,6 +192,11 @@ signature. Keep it stable: changing it logs everyone out.
 | `MAX_UPLOAD_BYTES` | `200000` | Attachment size cap |
 | `MAX_QUESTION_CHARS` | `8000` | Question length cap |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `1` / `10` | Connection pool size |
+| `GUARDRAIL_MODE` | `enforce` | `shadow` records every match and blocks nothing |
+| `GUARDRAIL_BLOCK_CATEGORIES` | `prompt_injection,secrets,rate_limit` | Which categories refuse the request |
+| `GUARDRAIL_JUDGE` | `true` | Screen each request with a second short Mistral call |
+| `GUARDRAIL_JUDGE_TIMEOUT` | `20` | Seconds to wait for the screening call |
+| `ASK_MAX_PER_HOUR` | `60` | Requests per user per hour |
 
 The embedding model must produce **384-dimensional** vectors, matching the `vector(384)`
 columns in `init.sql`; the app checks this at load time and says so if it doesn't.
@@ -285,6 +295,72 @@ re-reads the account, so a valid token alone is not enough to keep working.
 An admin cannot suspend their own account or drop their own admin role, so the last
 administrator can't lock themselves out.
 
+## Guardrails
+
+Requests are screened before they reach the model. Every match is recorded in
+`coding_agent_schema.blocked_queries` with the user, the conversation, the rule, and the
+source address; administrators read it at **`/guardrails`**.
+
+Rules target **intent and structure, never vocabulary**. That distinction is the whole
+design: this tool has to answer "how do I write a DELETE with a join", "how should I hash
+passwords", and "how does ransomware encrypt files", so a filter that reacts to alarming
+words would block exactly the work people came for. Every rule has paired must-block and
+must-allow tests for this reason.
+
+| Category | Default | What it catches |
+| --- | --- | --- |
+| `prompt_injection` | **blocks** | Instruction-override attempts, chat-template markers, and forged turn markers — in the question *and* inside uploaded files |
+| `secrets` | **blocks** | A credential in the typed question |
+| `rate_limit` | **blocks** | More than `ASK_MAX_PER_HOUR` requests from one account |
+| `secrets_in_file` | flags | A credential inside an uploaded file |
+| `off_scope` | flags | Requests for other languages, or not programming at all |
+| `malicious_intent` | flags | Malware authoring, credential theft, auth bypass, detection evasion |
+
+The fuzzy categories only flag by default, so a false positive costs a log row rather than a
+blocked colleague. Once the log shows they are accurate, promote them:
+
+```bash
+GUARDRAIL_BLOCK_CATEGORIES=prompt_injection,secrets,rate_limit,malicious_intent
+```
+
+Or go the other way and run `GUARDRAIL_MODE=shadow` for a week first, which records
+everything and blocks nothing.
+
+### Why the rules are built in rather than using a framework
+
+The air-gap is not the obstacle — [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails)
+runs offline and can reuse this app's own Mistral. False positives are. Generic LLM-safety
+validators are trained for chat assistants and flag ordinary developer vocabulary, and their
+strongest checks are ML-backed, which is exactly the part that does not travel offline for
+free. `guardrails.py` imports nothing beyond the standard library, adds no latency, and every
+refusal can be explained by a named rule.
+
+### The injection rule worth understanding
+
+The GPU proxy takes a single flat prompt in which turns are separated by nothing but the
+literal strings `SYSTEM:`, `USER:` and `ASSISTANT:`. A question containing one of those at
+the start of a line can therefore close its own turn and open a forged system turn. The
+`role_marker_injection` rule exists for that, and it is specific to a raw-completion
+backend — a chat-completions API would not have the problem.
+
+### The screening model
+
+With `GUARDRAIL_JUDGE=true` a second short call to the same proxy classifies scope and
+intent, at the cost of one extra round-trip per question. It runs **after** the
+deterministic rules and only when none of them blocked, so a prompt trying to override
+instructions never reaches it, and it is **never shown uploaded file content**, which is the
+least trustworthy input in the system. Any failure or unparseable reply is treated as
+ALLOW — a screener outage must not take the tool down. Set `GUARDRAIL_JUDGE=false` to drop
+it and keep the deterministic rules.
+
+### What the log stores
+
+Questions are written **redacted** — `guardrails.redact_secrets()` strips credentials first,
+so the table that records blocked credential pastes does not become the densest collection of
+secrets in the system. Uploaded file *contents* are never stored, only the file name. Rows
+survive deleting the account they belong to (`user_id` is set to NULL, the username is kept),
+because an abuse record that vanishes with the account is not an audit trail.
+
 ## Security notes
 
 - Session tokens live in an **httpOnly, SameSite=Strict** cookie, so page JavaScript can't
@@ -297,6 +373,9 @@ administrator can't lock themselves out.
 - Passwords are bcrypt-hashed. Logins are throttled per source address *and* per account,
   and a non-existent user costs the same time as a wrong password.
 - Set `COOKIE_SECURE=true` and terminate TLS in front of the app for a real deployment.
+- Requests are screened before reaching the model, and refusals are recorded — see
+  **Guardrails** above. Note the rate limit is per process, so it becomes per-worker under
+  multiple WSGI workers.
 
 ## Scope
 
