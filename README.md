@@ -101,28 +101,39 @@ Generate the secret separately and paste it in, so it stays the same across rest
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Write plain `KEY=value` lines with **no `export` prefix** — that form works both for shell
-sourcing and for systemd's `EnvironmentFile`, so one file covers both. Wrap any value
-containing a space, `$`, or a backtick in **single quotes**, or the shell will interpret it
-when the file is sourced and the variable will silently hold the wrong thing.
+Write plain `KEY=value` lines with **no `export` prefix** (though one is tolerated). That
+form is the intersection of what the app's own reader, bash `source`, and systemd's
+`EnvironmentFile` all accept, so a single file works with all three.
+
+Wrap any value containing a space, `$`, a backtick, or a `#` in **single quotes**. Quoting
+is what protects a password like `p@ss #1` from being truncated at the `#`, and what stops
+bash rewriting a `$` if you ever do source the file by hand. Surrounding quotes are stripped
+when the value is read, and an unquoted trailing `# comment` is dropped.
+
+Keep comments on their own line if you also use systemd's `EnvironmentFile` — systemd does
+not strip trailing comments, even though bash and this app do.
 
 `.env` is already in `.gitignore`. Keep it out of `assets/` — Dash serves that whole
 directory over HTTP.
 
-### Load it
+### Loading is automatic
 
-```bash
-set -a
-source .env
-set +a
-```
+The app reads `.env` itself on startup — there is nothing to source. It looks for the file
+**next to `app.py`**, not in whatever directory you happened to start from, so it works the
+same from a shell, from cron, or from a systemd unit with a different `WorkingDirectory`.
 
-`set -a` marks everything defined until `set +a` for export, which is what turns bare
-`KEY=value` lines into environment variables. Check it took before starting the server:
+A variable already set in the real environment **always wins** over the file, so an explicit
+`export`, a systemd `Environment=`, or a container's `-e` flag is never silently overridden
+by a stale file on disk. That also means `set -a; source .env; set +a` still works if you
+prefer it — it just is not needed any more.
+
+Check the configuration without starting the server:
 
 ```bash
 python -c "import backend; print('config ok:', backend.POSTGRES_DB)"
 ```
+
+Anything missing raises `ConfigError` naming the exact variable, before a port is bound.
 
 ### Edit it later
 
@@ -195,30 +206,16 @@ account that is active and admin from the start.
 ## 5. Run it
 
 ```bash
-set -a; source .env; set +a
 python app.py
 ```
 
-Open `http://<this-machine>:8054`.
+Open `http://<this-machine>:8054`. `.env` is picked up automatically — no sourcing needed.
 
-To run it in the background the way the old deployment did, put the two steps in a wrapper
-so you cannot forget the first one:
+To run it in the background the way the old deployment did:
 
 ```bash
-cat > run.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-cd "$(dirname "$0")"
-set -a; source .env; set +a
-exec python app.py
-EOF
-chmod +x run.sh
-
-nohup ./run.sh > backend.log 2>&1 &
+nohup python app.py > backend.log 2>&1 &
 ```
-
-`exec` matters here — it replaces the wrapper shell with Python, so a later `kill` reaches
-the app rather than the shell around it.
 
 Better still, let systemd own it, so it restarts on crash and starts on boot. Because `.env`
 is already in systemd's format, it can be pointed at directly:
@@ -232,7 +229,6 @@ After=network.target
 [Service]
 User=youruser
 WorkingDirectory=/path/to/claude-coding-agent
-EnvironmentFile=/path/to/claude-coding-agent/.env
 ExecStart=/path/to/venv/bin/python app.py
 Restart=always
 
@@ -245,8 +241,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now forge-code
 journalctl -u forge-code -f
 ```
 
-Note that systemd's `EnvironmentFile` parser is not a shell: it does no `$VAR` expansion and
-does not understand `export`. Plain `KEY=value` is exactly what it wants.
+No `EnvironmentFile=` line is needed — the app reads `.env` from its own directory. Add one
+anyway if you would rather systemd own the configuration; values it sets take precedence
+over the file. Note its parser is not a shell: it does no `$VAR` expansion and does not
+understand `export`.
 
 Werkzeug's built-in server is fine for a small internal team. For anything larger, put a
 real WSGI server in front:

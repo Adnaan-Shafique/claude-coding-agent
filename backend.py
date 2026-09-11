@@ -25,6 +25,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import bcrypt
 import jwt
@@ -43,6 +44,69 @@ from psycopg2.pool import ThreadedConnectionPool
 
 class ConfigError(RuntimeError):
     """Raised at startup when a required environment variable is missing or unusable."""
+
+
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def load_env_file(path: str | os.PathLike = ENV_FILE) -> int:
+    """Read a KEY=value file into os.environ and return how many variables were set.
+
+    Hand-rolled rather than pulling in python-dotenv: this app is built to run on an
+    air-gapped host, and one less package to get through the proxy is worth fifteen lines.
+
+    A variable already present in the real environment always wins, so an explicit
+    `export`, a systemd `Environment=`, or a container's `-e` flag is never silently
+    overridden by a stale file on disk.
+
+    The accepted format is deliberately the intersection of what bash `source` and
+    systemd's EnvironmentFile accept, so one file works with all three readers:
+
+        KEY=value                 bare value
+        KEY='value with spaces'   surrounding quotes are stripped
+        # comment                 whole-line comments, and blank lines, are ignored
+
+    A leading `export ` is tolerated. Values may contain `=` (only the first one splits).
+    An unquoted trailing ` # comment` is stripped, matching bash and python-dotenv — quote
+    the value if it genuinely contains a `#`.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return 0
+
+    loaded = 0
+    # surrogateescape so an odd byte in the file cannot crash startup.
+    for raw_line in path.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
+        line = raw_line.strip().lstrip("\ufeff")  # tolerate a UTF-8 BOM on the first line
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue  # not an assignment; ignore rather than guess
+        key = key.strip()
+        if not key:
+            continue
+
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+
+    return loaded
+
+
+# Load .env before any config below is read, so `python app.py` and a bare
+# `import backend` (tests, a REPL, the health one-liner in the README) behave the same
+# without anyone having to remember to source the file first.
+load_env_file()
 
 
 def _env(name: str, default: str | None = None, *, required: bool = False) -> str:

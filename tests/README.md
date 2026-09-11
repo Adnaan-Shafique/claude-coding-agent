@@ -11,8 +11,9 @@ pytest tests/test_backend.py
 ```
 
 Covers response parsing, credential and upload validation, prompt construction, JWT
-round-trips, and the GPU proxy's prompt flattening. `tests/conftest.py` supplies dummy
-environment variables because `backend.py` validates its configuration at import time.
+round-trips, `.env` parsing, and the GPU proxy's prompt flattening. `tests/conftest.py`
+supplies dummy environment variables because `backend.py` validates its configuration at
+import time.
 
 ## Integration tests — needs PostgreSQL
 
@@ -33,6 +34,12 @@ pytest tests/test_integration.py
 ```
 
 Without `FORGE_TEST_DB` set, they skip.
+
+The connection settings have to be passed explicitly like this — a `.env` file in the
+repository root is **not** used for them. `conftest.py` sets its dummy values before
+`backend` is imported, and `backend` only fills in variables that are not already set, so
+the dummies win. That is on purpose: this suite `TRUNCATE`s every table, and inheriting a
+production `.env` would mean a stray `pytest` wiped production.
 
 No GPU proxy is required — the tests stub `generate_code` and `summarize_qa`. pgvector is
 not required either: the similarity-search helpers are the only callers of the vector

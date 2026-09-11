@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import backend
@@ -221,3 +223,104 @@ def test_api_key_header_is_omitted_when_no_key_is_configured():
 
 def test_pgvector_literal_round_trips_as_floats():
     assert backend._to_pgvector([0.5, -1.0, 0.0]) == "[0.5,-1.0,0.0]"
+
+
+# --- .env loading -------------------------------------------------------
+
+def _write_env(tmp_path, body):
+    path = tmp_path / ".env"
+    path.write_text(body)
+    return path
+
+
+def test_plain_assignments_are_loaded(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_A", raising=False)
+    monkeypatch.delenv("FORGE_T_B", raising=False)
+    path = _write_env(tmp_path, "FORGE_T_A=one\nFORGE_T_B=two\n")
+    assert backend.load_env_file(path) == 2
+    assert os.environ["FORGE_T_A"] == "one"
+    assert os.environ["FORGE_T_B"] == "two"
+
+
+def test_the_real_environment_always_wins(tmp_path, monkeypatch):
+    # systemd Environment=, an explicit export, or docker -e must not be clobbered
+    # by a stale file on disk.
+    monkeypatch.setenv("FORGE_T_SET", "from-environment")
+    path = _write_env(tmp_path, "FORGE_T_SET=from-file\n")
+    assert backend.load_env_file(path) == 0
+    assert os.environ["FORGE_T_SET"] == "from-environment"
+
+
+def test_quotes_are_stripped_and_inner_spaces_kept(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_SQ", raising=False)
+    monkeypatch.delenv("FORGE_T_DQ", raising=False)
+    path = _write_env(tmp_path, "FORGE_T_SQ='a b  c'\nFORGE_T_DQ=\"d e\"\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_SQ"] == "a b  c"
+    assert os.environ["FORGE_T_DQ"] == "d e"
+
+
+def test_a_quoted_value_may_contain_a_hash(tmp_path, monkeypatch):
+    # A password like 'p@ss #1' must survive intact, not get truncated as a comment.
+    monkeypatch.delenv("FORGE_T_HASH", raising=False)
+    path = _write_env(tmp_path, "FORGE_T_HASH='p@ss #1'\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_HASH"] == "p@ss #1"
+
+
+def test_an_unquoted_trailing_comment_is_stripped(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_PORT", raising=False)
+    path = _write_env(tmp_path, "FORGE_T_PORT=8054  # the http port\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_PORT"] == "8054"
+
+
+def test_values_may_contain_equals_signs(tmp_path, monkeypatch):
+    # base64 and many generated keys end in padding.
+    monkeypatch.delenv("FORGE_T_B64", raising=False)
+    path = _write_env(tmp_path, "FORGE_T_B64=YWJjZA==\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_B64"] == "YWJjZA=="
+
+
+def test_export_prefix_is_tolerated(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_EXP", raising=False)
+    path = _write_env(tmp_path, "export FORGE_T_EXP=yes\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_EXP"] == "yes"
+
+
+def test_comments_blank_lines_and_junk_are_ignored(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_REAL", raising=False)
+    path = _write_env(
+        tmp_path,
+        "# a comment\n\n   \nnot-an-assignment\n=novalue\nFORGE_T_REAL=kept\n",
+    )
+    assert backend.load_env_file(path) == 1
+    assert os.environ["FORGE_T_REAL"] == "kept"
+
+
+def test_crlf_line_endings_do_not_leak_into_values(tmp_path, monkeypatch):
+    # A file edited on Windows must not yield "value\r", which would break int() casts
+    # and, worse, a hostname.
+    monkeypatch.delenv("FORGE_T_CRLF", raising=False)
+    path = tmp_path / ".env"
+    path.write_bytes(b"FORGE_T_CRLF=value\r\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_CRLF"] == "value"
+
+
+def test_a_utf8_bom_does_not_corrupt_the_first_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("FORGE_T_BOM", raising=False)
+    path = tmp_path / ".env"
+    path.write_bytes(b"\xef\xbb\xbfFORGE_T_BOM=ok\n")
+    backend.load_env_file(path)
+    assert os.environ["FORGE_T_BOM"] == "ok"
+
+
+def test_a_missing_file_is_not_an_error(tmp_path):
+    assert backend.load_env_file(tmp_path / "nope.env") == 0
+
+
+def test_a_directory_is_not_an_error(tmp_path):
+    assert backend.load_env_file(tmp_path) == 0

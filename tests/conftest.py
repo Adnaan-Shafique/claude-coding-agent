@@ -1,9 +1,15 @@
 """Test fixtures.
 
-These tests cover the pure logic — prompt building, response parsing, credential
-validation, upload checks, JWT round-trips — so they need neither a database nor the
-GPU proxy. The required environment variables are set here because backend.py validates
-its configuration at import time.
+The unit tests cover pure logic — prompt building, response parsing, credential
+validation, upload checks, JWT round-trips — so they need neither a database nor the GPU
+proxy. The required environment variables are set here because backend.py validates its
+configuration at import time.
+
+These are set BEFORE backend is imported, which means they take precedence over any .env
+file in the repository root (backend only fills in variables that are not already set).
+That ordering is deliberate: the integration suite TRUNCATEs every table, so a developer's
+real .env must never be what a test run connects to. Integration tests take their
+connection settings from the command line instead — see README.md in this directory.
 """
 
 import os
