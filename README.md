@@ -193,10 +193,11 @@ signature. Keep it stable: changing it logs everyone out.
 | `MAX_QUESTION_CHARS` | `8000` | Question length cap |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `1` / `10` | Connection pool size |
 | `GUARDRAIL_MODE` | `enforce` | `shadow` records every match and blocks nothing |
-| `GUARDRAIL_BLOCK_CATEGORIES` | `prompt_injection,secrets,rate_limit` | Which categories refuse the request |
+| `GUARDRAIL_BLOCK_CATEGORIES` | all but `malicious_intent`, `secrets_in_file` | Which categories refuse the request |
 | `GUARDRAIL_JUDGE` | `true` | Screen each request with a second short Mistral call |
 | `GUARDRAIL_JUDGE_TIMEOUT` | `20` | Seconds to wait for the screening call |
 | `ASK_MAX_PER_HOUR` | `60` | Requests per user per hour |
+| `GUARDRAIL_NON_LATIN_RATIO` | `0.2` | Share of a question's prose in a non-Latin script that counts as not-English |
 
 The embedding model must produce **384-dimensional** vectors, matching the `vector(384)`
 columns in `init.sql`; the app checks this at load time and says so if it doesn't.
@@ -309,22 +310,51 @@ must-allow tests for this reason.
 
 | Category | Default | What it catches |
 | --- | --- | --- |
-| `prompt_injection` | **blocks** | Instruction-override attempts, chat-template markers, and forged turn markers — in the question *and* inside uploaded files |
+| `prompt_injection` | **blocks** | Instruction-override attempts, chat-template markers, forged turn markers — in the question *and* inside uploaded files |
+| `persona` | **blocks** | Requests to adopt another role, stop being a coding assistant, or operate without restrictions |
+| `language` | **blocks** | Questions written in another language, or asking for the answer in one |
+| `off_scope` | **blocks** | Not a Python/SQL coding question, or a request for another language |
 | `secrets` | **blocks** | A credential in the typed question |
 | `rate_limit` | **blocks** | More than `ASK_MAX_PER_HOUR` requests from one account |
 | `secrets_in_file` | flags | A credential inside an uploaded file |
-| `off_scope` | flags | Requests for other languages, or not programming at all |
 | `malicious_intent` | flags | Malware authoring, credential theft, auth bypass, detection evasion |
 
-The fuzzy categories only flag by default, so a false positive costs a log row rather than a
-blocked colleague. Once the log shows they are accurate, promote them:
+`malicious_intent` is the one category that still only records. Promote it once the log shows
+the rule is accurate for your team:
 
 ```bash
-GUARDRAIL_BLOCK_CATEGORIES=prompt_injection,secrets,rate_limit,malicious_intent
+GUARDRAIL_BLOCK_CATEGORIES=prompt_injection,persona,language,off_scope,secrets,rate_limit,malicious_intent
 ```
 
 Or go the other way and run `GUARDRAIL_MODE=shadow` for a week first, which records
 everything and blocks nothing.
+
+### Persona and language
+
+Three rules are appended to every system prompt — a scope lock, a persona lock and a
+language lock — so the model refuses on its own even when a request slips past the rules
+above. They are phrased as what the assistant *is* rather than a list of prohibitions, which
+survives contradiction better.
+
+The screening rules then cover the same ground from the outside:
+
+- **Persona** targets constraint escape, not tone. Named jailbreak personas (`DAN`,
+  `developer mode`), identity replacement (`you are no longer a coding assistant`), roleplay
+  framing combined with "unrestricted"/"no rules", and `stay in character`. Deliberately
+  *not* matched: `act as a code reviewer`, `act as a senior Python developer` — ordinary
+  framings for real work. Harmless-but-irrelevant roleplay is caught by `off_scope` instead.
+- **Language** covers both directions. Asking for the answer in another language
+  (`explain this in Hindi`) is matched by name, and a question *written* in another script is
+  matched by measuring the share of its prose written outside the Latin alphabet
+  (`GUARDRAIL_NON_LATIN_RATIO`, default `0.2`).
+
+Code, inline backticks and quoted literals are stripped before that ratio is measured, so
+`print("नमस्ते")` stays an English question about Devanagari *data* and the tool remains
+usable for internationalised text. Accented Latin (café, Jürgen) is Latin.
+
+A language written in Latin letters — Hindi typed as `mujhe batao ki python kaise likhein` —
+is invisible to any script check, so the judge classifies language as well as scope. That is
+the one case where `GUARDRAIL_JUDGE=false` leaves a real gap.
 
 ### Why the rules are built in rather than using a framework
 
@@ -345,8 +375,10 @@ backend — a chat-completions API would not have the problem.
 
 ### The screening model
 
-With `GUARDRAIL_JUDGE=true` a second short call to the same proxy classifies scope and
-intent, at the cost of one extra round-trip per question. It runs **after** the
+With `GUARDRAIL_JUDGE=true` a second short call to the same proxy classifies scope, intent,
+language and persona, at the cost of one extra round-trip per question. Only requests the
+deterministic rules could not settle reach it, so a blocked request costs no inference at
+all. It runs **after** the
 deterministic rules and only when none of them blocked, so a prompt trying to override
 instructions never reaches it, and it is **never shown uploaded file content**, which is the
 least trustworthy input in the system. Any failure or unparseable reply is treated as
@@ -379,6 +411,7 @@ because an abuse record that vanishes with the account is not an audit trail.
 
 ## Scope
 
-Python and SQL only. Attachments are limited to `.py` and `.sql` (checked in the browser
-*and* on the server), and the system prompt tells the model to decline other languages
-rather than answer in them.
+Python and SQL coding questions, asked and answered in English. Attachments are limited to
+`.py` and `.sql` (checked in the browser *and* on the server). Enforced in three places: the
+screening rules in `guardrails.py`, the screening model, and the locks on every system
+prompt — see **Guardrails** above.
